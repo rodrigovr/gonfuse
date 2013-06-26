@@ -1,0 +1,179 @@
+#!/usr/bin/python
+
+import pymongo
+import gridfs
+
+import fuse
+import stat
+import os
+import errno
+import time
+
+import hashlib
+from bson.binary import Binary
+
+conn = pymongo.Connection()
+db = conn.gridfs
+
+fuse.fuse_python_api = (0, 2)
+
+
+class Gonfuse(fuse.Fuse):
+	def __init__(self, *args, **kw):
+		fuse.Fuse.__init__(self, *args, **kw)
+		db.files.ensure_index([ ('parent', 1), ('name', 1) ])
+
+	def getattr(self, path):
+		#print 'getattr ' + path + '\n'
+		st = fuse.Stat()
+
+		st.st_mode = 0755	
+		st.st_atime = int(time.time())
+		st.st_mtime = st.st_atime
+		st.st_ctime = st.st_ctime
+		st.st_nlink = 2
+		st.st_size  = 4096
+		st.st_uid   = 0
+		st.st_gid   = 0
+
+		if path == '/':
+			st.st_mode |= stat.S_IFDIR
+			#st.st_nlink = 3	
+		else:
+			f = db.files.find_one({'name': os.path.basename(path), 
+			                       'parent': os.path.dirname(path)})
+			if f:
+				st.st_mode  = f['mode']
+				st.st_atime = f['atime']
+				st.st_mtime = f['mtime']
+				st.st_ctime = f['ctime']
+				st.st_uid   = f['uid']
+				st.st_gid   = f['gid']
+				st.st_size  = f['size']
+			else:
+				return -errno.ENOENT
+
+		if st.st_mode & stat.S_IFDIR:
+			st.st_nlink = 2 + db.files.find({'parent': path}).count()
+
+		return st
+
+	def readdir(self, path, offset):
+		print 'readdir '+path+' : '+str(offset)+'\n'
+		ents = [ '.', '..' ]
+		for f in db.files.find({'parent': path}):
+			ents.append(f['name'].encode('utf-8'))
+		for e in ents:
+			yield fuse.Direntry(e)
+
+	def open(self, path, flags):
+		print 'open '+path+'\n'
+		ctime = int(time.time())
+		try:
+			db.files.insert({'name': os.path.basename(path), 
+			                 'parent': os.path.dirname(path),
+		                         'mode': 775 | stat.S_IFREG,
+			                 'uid': self.GetContext()['uid'],
+			                 'gid': self.GetContext()['gid'],
+			                 'atime': ctime,
+		                         'ctime': ctime,
+			                 'mtime': ctime,
+			                 'size': 0})
+		except pymongo.errors.DuplicateKeyError:
+		#	db.files.update({'name': os.path.basename(path), 
+		#	                 'parent': os.path.dirname(path)},{'$set':{''}})
+			pass
+		except pymongo.errors.PyMongoError:
+			return -errno.EIO
+
+	def read(self, path, size, offset):
+		print 'read '+path+'\n'
+		buf = ''
+		return buf
+
+	def write(self, path, buf, offset):
+		f = db.files.find_one({'name': os.path.basename(path), 
+			               'parent': os.path.dirname(path)})
+
+		if f['size'] == 0:
+			h = Binary(hashlib.sha256(buf).digest())
+			try:
+				db.blocks.insert({'_id':h, 'data': Binary(buf), 'size': len(buf), 'ref': 1})
+			except pymongo.errors.DuplicateKeyError:
+				db.blocks.update({'_id':h}, { '$inc': 'ref' }) 
+			except pymongo.errors.PyMongoError:
+				return -errno.EIO
+
+			db.files.update({'name': os.path.basename(path), 
+			                 'parent': os.path.dirname(path)},
+			                {'$set' : {'blocks': [h], 'mtime': int(time.time())}})
+
+		return len(buf)
+	
+	def mkdir(self, path, mode):
+		ctime = int(time.time())
+		try:
+			db.files.insert({'name': os.path.basename(path), 
+			                 'parent': os.path.dirname(path),
+		                         'mode': mode | stat.S_IFDIR,
+			                 'uid': self.GetContext()['uid'],
+			                 'gid': self.GetContext()['gid'],
+			                 'atime': ctime,
+		                         'ctime': ctime,
+			                 'mtime': ctime,
+			                 'size': 4096})
+		except pymongo.errors.DuplicateKeyError:
+			return -errno.EEXIST
+		except pymongo.errors.PyMongoError:
+			return -errno.EIO
+
+	def mknod(self, path, mode, dev):
+		ctime = int(time.time())
+		try:
+			db.files.insert({'name': os.path.basename(path), 
+			                 'parent': os.path.dirname(path),
+		                         'mode': mode | stat.S_IFREG,
+			                 'uid': self.GetContext()['uid'],
+			                 'gid': self.GetContext()['gid'],
+			                 'atime': ctime,
+		                         'ctime': ctime,
+			                 'mtime': ctime,
+			                 'size': 0})
+		except pymongo.errors.DuplicateKeyError:
+			return -errno.EEXIST
+		except pymongo.errors.PyMongoError:
+			return -errno.EIO
+
+	def unlink(self, path):
+		try:
+			f = db.files.find_one({'parent':path})
+			if f:
+				return -errno.ENOTEMPTY
+			db.files.remove({'name': os.path.basename(path), 
+			                 'parent': os.path.dirname(path)})
+		except pymongo.errors.PyMongoError:
+			return -errno.EIO
+
+	def rmdir(self, path):
+		self.unlink(path)
+
+	def chmod(self, path, mode):
+		pass
+
+	def chown(self, path, uid, gid):
+		pass
+
+	def truncate(self, path, offset):
+		try:
+			db.files.update({'name': os.path.basename(path), 
+			                 'parent': os.path.dirname(path)},
+			                {'$set':{'size':offset, 'mtime': int(time.time())}})
+			# remove blocks here
+		except pymongo.errors.PyMongoError:
+			return -errno.EIO
+
+
+if __name__ == '__main__':
+	g = Gonfuse()
+	g.parse(errex=1)
+	g.main()
