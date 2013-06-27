@@ -9,7 +9,6 @@ import os
 import errno
 import time
 
-import hashlib
 from bson.binary import Binary
 
 conn = pymongo.Connection()
@@ -17,12 +16,13 @@ db = conn.gridfs
 
 fuse.fuse_python_api = (0, 2)
 
+BLOCK_SIZE = (4*1024)
 
 class Gonfuse(fuse.Fuse):
 	def __init__(self, *args, **kw):
 		fuse.Fuse.__init__(self, *args, **kw)
 		db.files.ensure_index([ ('parent', 1), ('name', 1) ], unique=True)
-		db.blocks.ensure_index([ ('ref') ])
+		#db.blocks.ensure_index([ ('ref', 1) ])
 
 	def getattr(self, path):
 		st = fuse.Stat()
@@ -31,8 +31,8 @@ class Gonfuse(fuse.Fuse):
 		st.st_atime = int(time.time())
 		st.st_mtime = st.st_atime
 		st.st_ctime = st.st_ctime
-		st.st_nlink = 2
-		st.st_size  = 4096
+		st.st_nlink = 1
+		st.st_size  = BLOCK_SIZE
 		st.st_uid   = 0
 		st.st_gid   = 0
 
@@ -69,7 +69,7 @@ class Gonfuse(fuse.Fuse):
 		try:
 			db.files.insert({'name': os.path.basename(path), 
 			                 'parent': os.path.dirname(path),
-		                         'mode': 775 | stat.S_IFREG,
+		                         'mode': 0775 | stat.S_IFREG,
 			                 'uid': self.GetContext()['uid'],
 			                 'gid': self.GetContext()['gid'],
 			                 'atime': ctime,
@@ -81,41 +81,109 @@ class Gonfuse(fuse.Fuse):
 		except pymongo.errors.PyMongoError:
 			return -errno.EIO
 
+	def __read_block(self, f, n):
+		try:
+			if f['blocks'][n] != 0:
+				block = db.blocks.find_one({'_id':f['blocks'][n]})
+				return str(block['data'])
+			else:
+				return [0] * BLOCK_SIZE
+		except:
+			pass
+
 	def read(self, path, size, offset):
 		buf = ''
 		f = db.files.find_one({'name': os.path.basename(path), 
 			               'parent': os.path.dirname(path)})
-		block_size = (4*1024)
-		block_n = offset % block_size 
-		while size > 0:
-			block = db.blocks.find_one({'_id':f['blocks'][block_n]})
-			size -= block_size
+
+		blocks = []
+		try:
+			blocks = f['blocks']
+		except:
+			f['blocks'] = blocks
+
+		# unaligned read on first block
+		block_n = offset / BLOCK_SIZE
+		if offset % BLOCK_SIZE != 0:
+			pos = offset - (offset % BLOCK_SIZE) * BLOCK_SIZE
+			data = self.__read_block(f, block_n)
+			size -= len(data)
+			buf += data[pos:]
+		
+		
+		while size > 0 and block_n < len(f['blocks']):
+			data = self.__read_block(f, block_n)
+			size -= len(data)
 			block_n += 1
-			buf += str(block['data'])
-		print buf
-		return buf
+			buf += data
+
+		# truncate
+		return buf[0:size]
+
+	def __write_block(self, f, n, data):
+		if len(f['blocks']) == 0: 
+			f['blocks'] = [0]
+		if f['blocks'][n] == 0:
+			f['blocks'][n] = db.blocks.insert({'data':Binary(data)})
+		else:
+			db.blocks.update({'_id':f['blocks'][n]},
+			                 {'$set': {'data':Binary(data)}})
 
 	def write(self, path, buf, offset):
 		f = db.files.find_one({'name': os.path.basename(path), 
 			               'parent': os.path.dirname(path)})
 
-		if f['size'] == 0:
-			h = Binary(hashlib.sha256(buf).digest())
+		blocks = []
+		try:
+			blocks = f['blocks']
+		except:
+			f['blocks'] = blocks
+
+		size = len(buf)
+		written = 0
+
+		# sparse file support
+		block_n = 0
+		last_block = 0
+		pos = 0
+		while block_n < offset / BLOCK_SIZE:
 			try:
-				db.blocks.insert({'_id':h, 'data': Binary(buf), 
-				                  'size': len(buf), 'ref': 1})
-			except pymongo.errors.DuplicateKeyError:
-				db.blocks.update({'_id':h}, { '$inc': 'ref' }) 
-			except pymongo.errors.PyMongoError:
-				return -errno.EIO
+				last_block = f['blocks'][block_n]
+			except:
+				f['blocks'][block_n] = 0
+				last_block = 0
+			pos += BLOCK_SIZE
 
-			db.files.update({'name': os.path.basename(path), 
-			                 'parent': os.path.dirname(path)},
-			                {'$set' : {'blocks': [h],
-			                           'size': len(buf),
-			                           'mtime': int(time.time())}})
+		# first block			
+		if pos < offset:
+			data = self.__read_block(f, block_n)
+			written = min(size,BLOCK_SIZE)
+			data = data[0:offset-pos] + buf[0:written]
+			self.__write_block(f, block_n, data)
+			
 
-		return len(buf)
+		while written < size:
+			part = buf[written:max(size,BLOCK_SIZE)]
+			
+			# last block
+			if len(part) < BLOCK_SIZE:			
+				data = self.__read_block(f, block_n)
+				data = part + data[len(part):]
+				self.__write_block(f, block_n, data)
+			else:
+				self.__write_block(f, block_n, part)
+
+			block_n += 1
+			written += len(part)
+
+		f['size'] = max(f['size'], offset + written)
+		db.files.update({'name': os.path.basename(path), 
+			         'parent': os.path.dirname(path)},
+			        {'$set' : {'blocks': f['blocks'],
+			                   'size': f['size'],
+			                   'mtime': int(time.time())}})
+
+		return written
 	
 	def mkdir(self, path, mode):
 		ctime = int(time.time())
@@ -145,7 +213,7 @@ class Gonfuse(fuse.Fuse):
 			                 'atime': ctime,
 		                         'ctime': ctime,
 			                 'mtime': ctime,
-			                 'size': 0})
+			                 'size': 0, 'blocks' : []})
 		except pymongo.errors.DuplicateKeyError:
 			return -errno.EEXIST
 		except pymongo.errors.PyMongoError:
@@ -156,6 +224,15 @@ class Gonfuse(fuse.Fuse):
 			f = db.files.find_one({'parent':path})
 			if f:
 				return -errno.ENOTEMPTY
+
+			try:
+				for block in f['blocks']:
+					db.blocks.remove({'_id': block})
+			except pymongo.errors.PyMongoError:
+				return -errno.EIO
+			except:
+				pass
+
 			db.files.remove({'name': os.path.basename(path), 
 			                 'parent': os.path.dirname(path)})
 		except pymongo.errors.PyMongoError:
@@ -178,14 +255,15 @@ class Gonfuse(fuse.Fuse):
 			if not f:
 				return -errno.ENOENT
 
-			for block in f['blocks']:
-				db.blocks.update({'_id': block},{'$dec':'ref'})
+			block_size = (4*1024)
+			blocks = offset % block_size
+			f['blocks'] = f['blocks'][0:max(blocks,len(f['blocks']))]
 
 			db.files.update({'name': os.path.basename(path), 
 			                 'parent': os.path.dirname(path)},
 			                {'$set':{'size':offset,
 			                         'mtime': int(time.time()),
-			                         'blocks': []}})
+			                         'blocks': f['blocks']}})
 			
 		except pymongo.errors.PyMongoError:
 			return -errno.EIO
