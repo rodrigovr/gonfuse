@@ -21,10 +21,10 @@ fuse.fuse_python_api = (0, 2)
 class Gonfuse(fuse.Fuse):
 	def __init__(self, *args, **kw):
 		fuse.Fuse.__init__(self, *args, **kw)
-		db.files.ensure_index([ ('parent', 1), ('name', 1) ])
+		db.files.ensure_index([ ('parent', 1), ('name', 1) ], unique=True)
+		db.blocks.ensure_index([ ('ref') ])
 
 	def getattr(self, path):
-		#print 'getattr ' + path + '\n'
 		st = fuse.Stat()
 
 		st.st_mode = 0755	
@@ -37,8 +37,7 @@ class Gonfuse(fuse.Fuse):
 		st.st_gid   = 0
 
 		if path == '/':
-			st.st_mode |= stat.S_IFDIR
-			#st.st_nlink = 3	
+			st.st_mode |= stat.S_IFDIR	
 		else:
 			f = db.files.find_one({'name': os.path.basename(path), 
 			                       'parent': os.path.dirname(path)})
@@ -59,7 +58,6 @@ class Gonfuse(fuse.Fuse):
 		return st
 
 	def readdir(self, path, offset):
-		print 'readdir '+path+' : '+str(offset)+'\n'
 		ents = [ '.', '..' ]
 		for f in db.files.find({'parent': path}):
 			ents.append(f['name'].encode('utf-8'))
@@ -67,7 +65,6 @@ class Gonfuse(fuse.Fuse):
 			yield fuse.Direntry(e)
 
 	def open(self, path, flags):
-		print 'open '+path+'\n'
 		ctime = int(time.time())
 		try:
 			db.files.insert({'name': os.path.basename(path), 
@@ -80,15 +77,22 @@ class Gonfuse(fuse.Fuse):
 			                 'mtime': ctime,
 			                 'size': 0})
 		except pymongo.errors.DuplicateKeyError:
-		#	db.files.update({'name': os.path.basename(path), 
-		#	                 'parent': os.path.dirname(path)},{'$set':{''}})
 			pass
 		except pymongo.errors.PyMongoError:
 			return -errno.EIO
 
 	def read(self, path, size, offset):
-		print 'read '+path+'\n'
 		buf = ''
+		f = db.files.find_one({'name': os.path.basename(path), 
+			               'parent': os.path.dirname(path)})
+		block_size = (4*1024)
+		block_n = offset % block_size 
+		while size > 0:
+			block = db.blocks.find_one({'_id':f['blocks'][block_n]})
+			size -= block_size
+			block_n += 1
+			buf += str(block['data'])
+		print buf
 		return buf
 
 	def write(self, path, buf, offset):
@@ -98,7 +102,8 @@ class Gonfuse(fuse.Fuse):
 		if f['size'] == 0:
 			h = Binary(hashlib.sha256(buf).digest())
 			try:
-				db.blocks.insert({'_id':h, 'data': Binary(buf), 'size': len(buf), 'ref': 1})
+				db.blocks.insert({'_id':h, 'data': Binary(buf), 
+				                  'size': len(buf), 'ref': 1})
 			except pymongo.errors.DuplicateKeyError:
 				db.blocks.update({'_id':h}, { '$inc': 'ref' }) 
 			except pymongo.errors.PyMongoError:
@@ -106,7 +111,9 @@ class Gonfuse(fuse.Fuse):
 
 			db.files.update({'name': os.path.basename(path), 
 			                 'parent': os.path.dirname(path)},
-			                {'$set' : {'blocks': [h], 'mtime': int(time.time())}})
+			                {'$set' : {'blocks': [h],
+			                           'size': len(buf),
+			                           'mtime': int(time.time())}})
 
 		return len(buf)
 	
@@ -165,10 +172,21 @@ class Gonfuse(fuse.Fuse):
 
 	def truncate(self, path, offset):
 		try:
+			f = db.files.find_one({'name': os.path.basename(path), 
+			                 'parent': os.path.dirname(path)})
+
+			if not f:
+				return -errno.ENOENT
+
+			for block in f['blocks']:
+				db.blocks.update({'_id': block},{'$dec':'ref'})
+
 			db.files.update({'name': os.path.basename(path), 
 			                 'parent': os.path.dirname(path)},
-			                {'$set':{'size':offset, 'mtime': int(time.time())}})
-			# remove blocks here
+			                {'$set':{'size':offset,
+			                         'mtime': int(time.time()),
+			                         'blocks': []}})
+			
 		except pymongo.errors.PyMongoError:
 			return -errno.EIO
 
